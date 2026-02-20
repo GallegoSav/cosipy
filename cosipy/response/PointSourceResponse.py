@@ -88,10 +88,11 @@ class PointSourceResponse(Histogram):
 
             # unpolarized weights
             weights = np.full(pol_axis.nbins, (1. - polarization_level) / pol_axis.nbins)
-
+            
             # add polarized weights
             polarization_bin_index = pol_axis.find_bin(polarization_angle * u.deg)
             weights[polarization_bin_index] += polarization_level
+            weights *= self.axes['Pol'].nbins
 
             contents = np.tensordot(weights, self.contents, axes=(0, self.axes.label_to_index('Pol')))
 
@@ -100,7 +101,7 @@ class PointSourceResponse(Histogram):
         if flux is None:
             energy_axis = self.photon_energy_axis
             flux = get_integrated_spectral_model(spectrum, energy_axis)
-
+            
         expectation = np.tensordot(contents, flux.contents, axes=(0, 0))
 
         # if self is sparse, expectation will be a SparseArray with
@@ -110,6 +111,6 @@ class PointSourceResponse(Histogram):
                          copy_contents = False)
 
         if not hist.unit == u.dimensionless_unscaled:
-            raise RuntimeError("Expectation should be dimensionless, but has units of " + str(hist.unit) + ".")
-
+            raise RuntimeError(f"Expectation should be dimensionless, but has units of {(hist.unit)}.")
+        
         return hist

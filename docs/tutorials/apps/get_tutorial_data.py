@@ -3,7 +3,7 @@ import os
 import subprocess
 from pathlib import Path
 from cosipy.util import fetch_wasabi_file
-from cosipy import COSILike, BinnedData
+from cosipy import BinnedData
 #
 indir=str("./")
 #
@@ -34,8 +34,8 @@ get_data(wasabipath,outpath,False)
 #
 #Get Orientation files
 #
-filename="DC3_final_530km_3_month_with_slew_1sbins_GalacticEarth_SAA.ori"
-wasabipath=os.path.join('COSI-SMEX/DC3/Data/Orientation',filename)
+filename="DC3_final_530km_3_month_with_slew_1sbins_GalacticEarth_SAA.fits"
+wasabipath=os.path.join('COSI-SMEX/develop/Data/Orientation',filename)
 outpath=os.path.join(indir,filename)
 get_data(wasabipath,outpath,False)
 

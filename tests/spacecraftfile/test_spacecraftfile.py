@@ -1,5 +1,5 @@
 from cosipy import test_data
-from pytest import approx
+from pytest import approx, raises
 from cosipy import SpacecraftFile
 import numpy as np
 import astropy.units as u
@@ -13,11 +13,58 @@ from cosipy.response import FullDetectorResponse
 
 energy_edges = 10**np.linspace(2, 4, 10 + 1) # ten bins from 100 to 10000 KeV
 
+def test_ori_to_fits(tmp_path):
+
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+
+    ori = SpacecraftFile.open(ori_path)
+
+    ori.write_fits(tmp_path / "ori_test.fits")
+    ori2 = SpacecraftFile.open(tmp_path / "ori_test.fits")
+
+    assert np.allclose(ori.get_time().value,
+                       ori2.get_time().value)
+
+    assert np.allclose(ori.get_altitude(),
+                       ori2.get_altitude())
+
+    assert np.allclose(ori.livetime,
+                       ori2.livetime)
+
+    assert np.allclose(ori.x_pointings.l.rad,
+                       ori2.x_pointings.l.rad)
+    assert np.allclose(ori.x_pointings.b.rad,
+                       ori2.x_pointings.b.rad)
+
+    assert np.allclose(ori.z_pointings.l.rad,
+                       ori2.z_pointings.l.rad)
+    assert np.allclose(ori.z_pointings.b.rad,
+                       ori2.z_pointings.b.rad)
+
+    assert np.allclose(ori.earth_zenith.l.rad,
+                       ori2.earth_zenith.l.rad)
+    assert np.allclose(ori.earth_zenith.b.rad,
+                       ori2.earth_zenith.b.rad)
+
+    # test overwriting behavior
+    with raises(RuntimeError):
+        ori.write_fits(tmp_path / "ori_test.fits")
+
+    ori.write_fits(tmp_path / "ori_test.fits", overwrite=True)
+
+    # test compressed write behavior
+    ori.write_fits(tmp_path / "ori_test.fits", compress=True)
+    ori2 = SpacecraftFile.open(tmp_path / "ori_test.fits.gz")
+
+    # test overwriting behavior
+    with raises(RuntimeError):
+        ori.write_fits(tmp_path / "ori_test.fits", compress=True)
+
 def test_get_time():
 
-    ori_path = test_data.path / "20280301_first_10sec.ori"
+    ori_path = test_data.path / "20280301_first_10sec.fits"
 
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori = SpacecraftFile.open(ori_path)
 
     start = 1835478000.0
     assert np.allclose(ori.get_time().value,
@@ -26,8 +73,8 @@ def test_get_time():
 
 def test_get_time_delta():
 
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
     time_delta = ori.get_time_delta()
     time_delta.format = "sec"
 
@@ -35,16 +82,16 @@ def test_get_time_delta():
 
 def test_altitude():
 
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
     altitude = ori.get_altitude()
 
     assert np.allclose(altitude, np.zeros(11))
 
 def test_get_attitude():
 
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     attitude = ori.get_attitude()
 
@@ -98,7 +145,7 @@ def test_get_attitude():
 def test_get_target_in_sc_frame():
 
     ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -113,12 +160,19 @@ def test_get_target_in_sc_frame():
                        np.array([46.733430, 46.687559, 46.641664, 46.595745, 46.549801, 46.503833,
                                  46.457841, 46.411825, 46.365785, 46.319722, 46.273634]))
 
+    # make sure we get right result regardless of source inertial frame
+    target_coord_icrs = target_coord.transform_to("icrs")
+
+    path_in_sc_icrs = ori.get_target_in_sc_frame(target_coord_icrs)
+
+    assert np.allclose(path_in_sc.lon.deg, path_in_sc_icrs.lon.deg)
+    assert np.allclose(path_in_sc.lat.deg, path_in_sc_icrs.lat.deg)
 
 def test_get_dwell_map():
 
     response_path =test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -147,22 +201,49 @@ def test_get_dwell_map():
 def test_get_scatt_map():
 
     response_path =test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
 
-    # test without earth occultation, as Crab is entirely occluded;
-    # TODO: use a better .ori file for testing
-    scatt_map = ori.get_scatt_map(nside=16, earth_occ=False)
+    # With this orientation file, Crab is entirely occluded, so
+    # scatt map is empty!  But the code should still work.
+    scatt_map = ori.get_scatt_map(target_coord=target_coord,
+                                  nside=16, earth_occ=True)
     ax_map = scatt_map.get_axes_map(nside=16)
+
+    # This orientation file does not occlude the Crab.
+    ori_path = test_data.path / "DC3-3mo-arbitrary-10s.fits"
+    ori = SpacecraftFile.open(ori_path)
+    scatt_map = ori.get_scatt_map(target_coord=target_coord,
+                                  nside=16, earth_occ=True)
+    ax_map = scatt_map.get_axes_map(nside=16)
+
+    ori.cache_earth_occ = True
+    assert ori.cache_earth_occ
+
+    scatt_map2 = ori.get_scatt_map(target_coord=target_coord,
+                                   nside=16, earth_occ=True)
+    assert np.all(scatt_map2.attitudes.as_quat() == \
+                  scatt_map.attitudes.as_quat()) and \
+            np.all(scatt_map2.weights == scatt_map.weights)
+
+    ori.cache_earth_occ = False
+    assert not ori.cache_earth_occ
+
+    scatt_map3 = ori.get_scatt_map(target_coord=target_coord,
+                                   nside=16, earth_occ=True)
+    assert np.all(scatt_map3.attitudes.as_quat() == \
+                  scatt_map.attitudes.as_quat()) and \
+            np.all(scatt_map3.weights == scatt_map.weights)
+
 
 def test_get_psr_rsp():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -229,8 +310,8 @@ def test_get_psr_rsp():
 def test_get_arf():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -263,8 +344,8 @@ def test_get_arf():
 def test_get_rmf():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -315,8 +396,8 @@ def test_get_rmf():
 def test_get_pha():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -358,8 +439,8 @@ def test_get_pha():
 def test_plot_arf():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -385,8 +466,8 @@ def test_plot_arf():
 def test_plot_rmf():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     target_name = "Crab"
     target_coord = SkyCoord(l=184.5551, b = -05.7877, unit = (u.deg, u.deg), frame = "galactic")
@@ -413,8 +494,8 @@ def test_plot_rmf():
 def test_source_interval():
 
     response_path = test_data.path / "test_full_detector_response.h5"
-    ori_path = test_data.path / "20280301_first_10sec.ori"
-    ori = SpacecraftFile.parse_from_file(ori_path)
+    ori_path = test_data.path / "20280301_first_10sec.fits"
+    ori = SpacecraftFile.open(ori_path)
 
     times = ori.get_time().to_value(format = "unix")
     new_ori = ori.source_interval(Time(times[0]+0.1, format = "unix"),

@@ -7,7 +7,7 @@ import mhealpy as hp
 
 import matplotlib.pyplot as plt
 
-from .fast_ts_fit import FastTSMap
+from .fast_ts_fit import FastTSMap, Frame
 
 import logging
 logger = logging.getLogger(__name__)
@@ -216,7 +216,15 @@ class MOCTSMap(FastTSMap):
 
         while nside <= max_nside:
 
-            src_locs = self._get_hypothesis_coords(nside, pixels)
+            if self._cds_frame == Frame.LOCAL:
+                # compute possible source dirs in same frame
+                # we will use to translate them to local-frame paths
+                hyp_frame = self._orientation.frame
+            else: # galactic frame
+                hyp_frame = "galactic"
+
+            src_locs = self._get_hypothesis_coords(nside, pixels,
+                                                   coordsys=hyp_frame)
 
             results = [
                 self._fit_one_direction(source,
@@ -317,3 +325,6 @@ class MOCTSMap(FastTSMap):
 
         if save_plot:
             fig.savefig(Path(save_dir)/save_name, dpi = dpi)
+
+        plt.show()
+        plt.close(fig)
