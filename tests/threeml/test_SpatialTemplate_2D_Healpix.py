@@ -1,6 +1,7 @@
 from cosipy.threeml.custom_functions import SpatialTemplate_2D_Healpix
 from mhealpy import HealpixMap
 import astropy.units as u
+import numpy as np
 
 def test_2DTemplateHealpix(tmp_path):
   
