@@ -20,7 +20,7 @@ def test_2DTemplateHealpix(tmp_path):
   spatial_shape =  SpatialTemplate_2D_Healpix(fits_file=tmp_path/"HealpixMap_test.fits")
 
   #test evaluate
-  value = spatial_shape.evaluate(0*u.deg, 0*u.deg)
+  value = spatial_shape.evaluate(0*u.deg, 0*u.deg, spatial_shape.K.value, spatial_shape.hash.value)
 
   #test boundaries
   boundaries = spatial_shape.get_boundaries()
