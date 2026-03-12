@@ -11,7 +11,7 @@ def test_2DTemplateHealpix(tmp_path):
 
   # normalise to the pixel area
   area = skymap.pixarea().value
-  skymap[:] = skymap[:]/(np.sum(skymap)*pix_area)
+  skymap[:] = skymap[:]/(np.sum(skymap)*area)
 
   # write the fits file
   skymap.write_map(tmp_path/"HealpixMap_test.fits", overwrite=True)
