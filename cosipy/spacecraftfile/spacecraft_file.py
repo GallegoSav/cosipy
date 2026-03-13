@@ -412,7 +412,7 @@ class SpacecraftHistory:
                          header = None, comment = '#')
         #if there is EN at the end of the ori file, then the last line will
         #contain NaN values.
-        vals = df.dropna()
+        vals = df.dropna().transpose()
 
         # assign units to read values
         time_stamps = Time(vals[0], format="unix", copy=False)
