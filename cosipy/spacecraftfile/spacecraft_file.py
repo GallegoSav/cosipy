@@ -410,7 +410,9 @@ class SpacecraftHistory:
         df = pd.read_csv(file, sep=r"\s+", skiprows=1,
                          usecols=tuple(range(1,10)),
                          header = None, comment = '#')
-        vals = df.values[:-1].transpose()
+        #if there is EN at the end of the ori file, then the last line will
+        #contain NaN values.
+        vals = df.dropna()
 
         # assign units to read values
         time_stamps = Time(vals[0], format="unix", copy=False)
