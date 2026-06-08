@@ -92,6 +92,7 @@ class UnBinnedData(DataIO):
             'Chi galactic' : 1D np.ndarray [float] (degrees)
             'Psi galactic' : 1D np.ndarray [float] (degrees)
             'CO seq'     : 1D np.ndarray [int]
+			'Id particle' : 1D np.ndarray [int]
         }
 
         Arrays contain unbinned photon data and are bare arrays,
@@ -172,7 +173,7 @@ class UnBinnedData(DataIO):
 
 
         # lists to hold parsed values
-        m_eg, m_ee, tt, CO_seq = [], [], [], []
+        m_eg, m_ee, tt, CO_seq , Id = [], [], [], [], []
 
         # Components of dg (position vector from 1st interaction to 2nd)
         dg_x, dg_y, dg_z = [], [], []
@@ -246,7 +247,10 @@ class UnBinnedData(DataIO):
                 case "SQ": # Number of Compton scattering interactions
                     fields = this_line.split(maxsplit=2)
                     this_event["CO_seq"] = int(fields[1])
-
+                
+                case "OI": #True fst inter informations from the sim file 
+                    fields = this_line.split(maxsplit=2)
+                    this_event["id"] = int(fields[])
                 case "CH": # Position info for one interaction
                     fields = this_line.split(maxsplit=5)
                     interaction_id = int(fields[1])
