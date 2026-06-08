@@ -589,7 +589,8 @@ class UnBinnedData(DataIO):
         units = (u.keV, u.s,   u.rad, u.rad,
                  u.rad, u.rad, u.rad, u.rad,
                  u.cm,  u.deg, u.deg,
-                 u.dimensionless_unscaled)
+                 u.dimensionless_unscaled,
+                u.dimensionless_unscaled)
 
         # Old UnBinned data structure did not have the last field
         # (CO_seq); this special case should be removed for DC4.
