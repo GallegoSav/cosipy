@@ -92,7 +92,7 @@ class UnBinnedData(DataIO):
             'Chi galactic' : 1D np.ndarray [float] (degrees)
             'Psi galactic' : 1D np.ndarray [float] (degrees)
             'CO seq'     : 1D np.ndarray [int]
-			'Id particle' : 1D np.ndarray [int]
+			'Particle Id' : 1D np.ndarray [int]
         }
 
         Arrays contain unbinned photon data and are bare arrays,
@@ -249,8 +249,9 @@ class UnBinnedData(DataIO):
                     this_event["CO_seq"] = int(fields[1])
                 
                 case "OI": #True fst inter informations from the sim file 
-                    fields = this_line.split(maxsplit=2)
-                    this_event["id"] = int(fields[])
+                    fields = this_line.split(maxsplit=11)
+                    this_event["id"] = int(fields[10])
+					
                 case "CH": # Position info for one interaction
                     fields = this_line.split(maxsplit=5)
                     interaction_id = int(fields[1])
@@ -277,7 +278,8 @@ class UnBinnedData(DataIO):
                             m_ee.append(this_event["m_ee"])
                             tt.append(this_event["tt"])
                             CO_seq.append(this_event["CO_seq"])
-
+                            Id.append(this_event["id"])
+							
                             # compute position vector between
                             # first two interactions
                             v1 = this_event["v1"]
@@ -322,6 +324,7 @@ class UnBinnedData(DataIO):
 
         tt = np.array(tt)
         CO_seq = np.array(CO_seq)
+        Id = np.array(Id)
         dg_x = np.array(dg_x)
         dg_y = np.array(dg_y)
         dg_z = np.array(dg_z)
@@ -430,7 +433,8 @@ class UnBinnedData(DataIO):
             'Distance' : dist,
             'Chi galactic' : chi_gal,
             'Psi galactic' : psi_gal,
-            'Compton Seq' : CO_seq
+            'Compton Seq' : CO_seq,
+            'Particle Id' : Id
         }
         
         # For simulation the timetags are shuffled, so we need to sort
