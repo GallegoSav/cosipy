@@ -91,8 +91,8 @@ class UnBinnedData(DataIO):
             'Distance'   : 1D np.ndarray [float] (cm)
             'Chi galactic' : 1D np.ndarray [float] (degrees)
             'Psi galactic' : 1D np.ndarray [float] (degrees)
-            'CO seq'     : 1D np.ndarray [int]
-			'Particle Id' : 1D np.ndarray [int]
+            'CO seq'     : 1D np.ndarray [int] (unitless)
+			'Particle Id' : 1D np.ndarray [int] (unitless)
         }
 
         Arrays contain unbinned photon data and are bare arrays,
@@ -278,7 +278,13 @@ class UnBinnedData(DataIO):
                             m_ee.append(this_event["m_ee"])
                             tt.append(this_event["tt"])
                             CO_seq.append(this_event["CO_seq"])
-                            Id.append(this_event["id"])
+
+                            #Check if the OI information was in the tra file
+                            #to be consistent with real data or before DC5 tra files
+                            if this_event["id"] is not None :
+                                Id.append(this_event["id"])
+                            else :
+                                Id.append(0) #0 if no Id 
 							
                             # compute position vector between
                             # first two interactions
