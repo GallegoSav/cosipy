@@ -250,7 +250,7 @@ class UnBinnedData(DataIO):
                 
                 case "OI": #True fst inter informations from the sim file 
                     fields = this_line.split(maxsplit=11)
-                    this_event["id"] = int(fields[10])
+                    this_event["id"] = int(fields[11])
 					
                 case "CH": # Position info for one interaction
                     fields = this_line.split(maxsplit=5)
