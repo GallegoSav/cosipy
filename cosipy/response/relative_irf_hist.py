@@ -315,6 +315,27 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         """
         return self._diff_aeff.axes
 
+    @property
+    def differential_effective_area_hist(self) -> Histogram:
+        """
+        The internal differential effective area histogram, with the
+        axes described in :attr:`axes` and implicit content units of
+        ``cm^2 / sr / rad / keV`` (per unit PsiChi solid angle, per
+        unit kinematic scattering angle Phi and per unit measured
+        energy). Unphysical bins are zero.
+
+        This is the internal object, not a copy: do not modify it.
+        """
+        return self._diff_aeff
+
+    @property
+    def pol_convention(self):
+        """
+        Polarization convention (in the spacecraft frame) that defines
+        the origin of the ``Zeta`` azimuthal angle.
+        """
+        return self._pol_convention
+
     def _parallel_interp(self, hist, build_args, raw_arrays):
         """
         Interpolate ``hist`` at the points described by ``raw_arrays``,

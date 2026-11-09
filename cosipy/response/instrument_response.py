@@ -28,7 +28,7 @@ class BinnedInstrumentResponse(BinnedInstrumentResponseInterface):
         self._axes = data.axes
 
         if set(self._axes.labels) != {'Em','PsiChi','Phi'}:
-            raise ValueError(f"Unexpected axes labels. Expecting \"{{'Em','PsiChi','Phi'}}\", got {axes.labels}")
+            raise ValueError(f"Unexpected axes labels. Expecting \"{{'Em','PsiChi','Phi'}}\", got {list(self._axes.labels)}")
 
         if self._dr.measurement_axes["Em"] != self._axes["Em"]:
             # Matches the v0.3 behaviour
@@ -284,7 +284,7 @@ class BinnedInstrumentResponse(BinnedInstrumentResponseInterface):
 
         # Either initialize a new or clear cache
         if out is None:
-            out = Quantity(np.zeros(out_axes.shape), dr_pix.unit, copy = None)
+            out = Quantity(np.zeros(out_axes.shape), self._dr.unit, copy = None)
         elif not add_inplace:
             out.value[:] = 0
 
