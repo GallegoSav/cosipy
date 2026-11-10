@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import healpy as hp
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from histpy import Axis, Axes, HealpixAxis, Histogram
@@ -18,8 +19,11 @@ from cosipy.response.relative_irf_detector_response import RelativeIRFDetectorRe
 # Fixtures
 # ----------------------------------------------------------------------
 
+IRF_EI_EDGES = np.geomspace(100, 1000, 4)
+
+
 def _irf_axes(nside=1,
-              ei_edges=np.geomspace(100, 1000, 4),
+              ei_edges=IRF_EI_EDGES,
               eps_edges=np.linspace(-0.5, 0.5, 9),
               phi_edges_deg=np.linspace(0, 180, 7),
               theta_edges_deg=np.linspace(-90, 90, 5),
@@ -35,52 +39,41 @@ def _irf_axes(nside=1,
     ])
 
 
-def _make_random_irf(nside=1, seed=0, **kwargs):
+def _make_random_irf(nside=1, seed=0, aeff=None, **kwargs):
     rng = np.random.default_rng(seed)
     axes = _irf_axes(nside=nside, **kwargs)
-    return IRFRelativeHistUnpolarized(Histogram(axes, contents=rng.random(axes.nbins), unit=u.cm * u.cm))
+    return IRFRelativeHistUnpolarized(Histogram(axes, contents=rng.random(axes.nbins), unit=u.cm * u.cm),
+                                      aeff=aeff)
 
 
-def _make_constant_density_irf(density=2.0, nside=1):
+def _histogram_total(irf):
     """
-    IRF whose differential effective area is exactly ``density``
-    (cm2/sr/rad/keV) everywhere within its axes ranges. The Phi and
-    Theta ranges are chosen so that no bin is in the unphysical
-    region (Phi + Theta outside [0, 180] deg). Then the multilinear
-    interpolation is exactly constant, and the integral over the full
-    measurement space must equal the total effective area.
+    Content (cm2) of the IRF histogram per (NuLambda, Ei), recomputed
+    independently from the differential effective area: density times
+    phase space, summed over Epsilon, Phi, Theta and Zeta. Unphysical
+    bins are zero.
     """
 
-    axes = _irf_axes(nside=nside,
-                     phi_edges_deg=np.linspace(20, 160, 8),
-                     theta_edges_deg=np.linspace(-10, 10, 5))
+    d = irf.differential_effective_area_hist
+    ax = d.axes
 
-    phi = axes['Phi'].edges.to_value(u.rad)
-    theta = axes['Theta'].edges.to_value(u.rad)
-    zeta = axes['Zeta'].edges.angle.to_value(u.rad)
-
-    phi_m, theta_m, zeta_m = np.meshgrid(phi, theta, zeta, indexing='ij')
+    phi_m, theta_m, zeta_m = np.meshgrid(ax['Phi'].edges, ax['Theta'].edges, ax['Zeta'].edges, indexing='ij')
 
     ps_cds = RelativeCDSCoordinates.get_relative_cds_phase_space(phi_m[:-1, :-1, :-1], phi_m[1:, :-1, :-1],
                                                                  theta_m[:-1, :-1, :-1], theta_m[:-1, 1:, :-1],
                                                                  zeta_m[:-1, :-1, :-1], zeta_m[:-1, :-1, 1:])
 
-    ei_c = axes['Ei'].centers.to_value(u.keV)
-    eps_w = axes['Epsilon'].widths
+    ps_em = ax['Ei'].centers[:, None] * ax['Epsilon'].widths[None, :]
 
-    ps_em = ei_c[:, None] * eps_w[None, :]
-
-    contents = density * ps_em[None, :, :, None, None, None] * ps_cds[None, None, None, :, :, :]
-    contents = np.broadcast_to(contents, axes.nbins).copy()
-
-    return IRFRelativeHistUnpolarized(Histogram(axes, contents=contents, unit=u.cm * u.cm))
+    return np.einsum('pieabz,ie,abz->pi', np.asarray(d.contents), ps_em, ps_cds)
 
 
-def _measurement_axes(em_edges=np.geomspace(20, 2000, 11),
+def _measurement_axes(em_edges=np.geomspace(10, 5000, 31),
                       phi_edges_deg=np.linspace(0, 180, 7),
                       nside=4,
                       coordsys=SpacecraftFrame(),
                       order=('Em', 'Phi', 'PsiChi')):
+    """Defaults cover the full IRF range: Ei*(1+Epsilon) in [50, 1500] keV."""
 
     axes = {'Em': Axis(np.asarray(em_edges) * u.keV, label='Em', scale='log'),
             'Phi': Axis(np.asarray(phi_edges_deg) * u.deg, label='Phi'),
@@ -104,10 +97,13 @@ class TestConstruction:
 
         assert isinstance(dr, FullDetectorResponse)
         assert list(dr.axes.labels) == ['NuLambda', 'Ei', 'Phi', 'PsiChi', 'Em']
-        assert dr.nside == irf.axes['NuLambda'].nside
         assert dr.unit == u.cm ** 2
         assert not dr.is_relative_cds
         assert dr.pa_convention is None
+
+        # NuLambda and Ei are the IRF ones
+        assert dr.nside == irf.axes['NuLambda'].nside
+        np.testing.assert_allclose(dr.axes['Ei'].edges.to_value(u.keV), irf.axes['Ei'].edges)
 
         # PsiChi always in local coordinates, same pixelization
         assert isinstance(dr.axes['PsiChi'].coordsys, SpacecraftFrame)
@@ -117,22 +113,7 @@ class TestConstruction:
         assert dr.measurement_axes['Em'] == meas['Em']
         assert dr.measurement_axes['Phi'] == meas['Phi']
 
-        # Default energy axis is the IRF's one, with units
-        np.testing.assert_allclose(dr.axes['Ei'].edges.to_value(u.keV), irf.axes['Ei'].edges)
-
-        # Pixel shape follows the rest axes
         assert dr[0].contents.shape == tuple(dr.axes[1:].nbins)
-
-    def test_custom_energy_and_nside(self):
-
-        irf = _make_random_irf(nside=1)
-        ei = Axis(np.geomspace(150, 900, 6) * u.keV, label='Ei', scale='log')
-
-        dr = RelativeIRFDetectorResponse(irf, _measurement_axes(), energy_axis=ei, nside=2)
-
-        assert dr.nside == 2
-        assert dr.axes['Ei'] == ei
-        assert dr._get_pixel(5).shape == tuple(dr.axes[1:].nbins)
 
     def test_bad_inputs(self):
 
@@ -148,152 +129,224 @@ class TestConstruction:
             RelativeIRFDetectorResponse(irf, bad)
 
         with pytest.raises(ValueError):
-            RelativeIRFDetectorResponse(irf, _measurement_axes(),
-                                        energy_axis=Axis(np.geomspace(100, 1000, 4) * u.keV, label='E'))
+            RelativeIRFDetectorResponse(irf, _measurement_axes(), phi_samples=0)
 
         with pytest.raises(NotImplementedError):
             RelativeIRFDetectorResponse.open("some_file.h5")
 
 
-class TestNormalization:
+class TestContentConservation:
 
-    @pytest.mark.parametrize('psichi_subdivision, rtol', [(1, 0.06), (2, 0.03)])
-    def test_total_effective_area(self, psichi_subdivision, rtol):
+    @pytest.mark.parametrize('phi_edges_deg', [np.linspace(0, 180, 7),     # IRF binning
+                                               np.linspace(0, 180, 19)])   # Finer binning
+    @pytest.mark.parametrize('nside, psichi_subdivision', [(2, 0), (4, 1)])
+    def test_total_equals_histogram(self, phi_edges_deg, nside, psichi_subdivision):
         """
-        For a constant-density IRF, integrating over measurement axes
-        that cover the whole IRF range must recover the total
-        effective area, up to the PsiChi quadrature error at the edges
-        of the Theta (ARM) band.
-        """
-
-        irf = _make_constant_density_irf()
-
-        # Em covers Ei * (1 + Epsilon) for all Ei centers. Phi edges
-        # aligned with the IRF ones.
-        meas = _measurement_axes(em_edges=np.geomspace(20, 2000, 13),
-                                 phi_edges_deg=np.linspace(20, 160, 8),
-                                 nside=8)
-
-        dr = RelativeIRFDetectorResponse(irf, meas, phi_samples=3, psichi_subdivision=psichi_subdivision)
-
-        tot_aeff = np.asarray(irf._tot_aeff.contents)  # cm2, (NuLambda, Ei)
-
-        for pix in [0, 5, 11]:
-            binned = dr._get_pixel(pix).sum(axis=(1, 2, 3))
-            np.testing.assert_allclose(binned, tot_aeff[pix], rtol=rtol)
-
-    def test_convergence_with_subdivision(self):
-
-        irf = _make_constant_density_irf()
-        meas = _measurement_axes(em_edges=np.geomspace(20, 2000, 13),
-                                 phi_edges_deg=np.linspace(20, 160, 8),
-                                 nside=4)
-
-        tot_aeff = np.asarray(irf._tot_aeff.contents)[3]
-
-        errors = []
-        for sub in (0, 1, 2):
-            dr = RelativeIRFDetectorResponse(irf, meas, psichi_subdivision=sub)
-            errors.append(np.max(np.abs(dr._get_pixel(3).sum(axis=(1, 2, 3)) / tot_aeff - 1)))
-
-        assert errors[2] < errors[0]
-
-    def test_energy_outside_irf_is_zero(self):
-
-        irf = _make_random_irf()
-        ei = Axis([10, 50, 300, 5000, 9000] * u.keV, label='Ei')
-
-        dr = RelativeIRFDetectorResponse(irf, _measurement_axes(), energy_axis=ei)
-
-        data = dr._get_pixel(0)
-
-        assert np.all(data[0] == 0)    # Ei center 30 keV < 100 keV
-        assert np.all(data[3] == 0)    # Ei center 7000 keV > 1000 keV
-        assert np.any(data[1] > 0)
-
-
-class TestConsistencyWithUnbinned:
-
-    def test_matches_brute_force_integration(self):
-        """
-        Compare a few bins with a brute force integration of the IRF
-        unbinned differential effective area (same Phi and PsiChi
-        sub-samples, fine grid in Em). This checks the coordinate
-        conventions (Epsilon, Theta = phi_geo - Phi, Zeta) and the
-        phase-space normalization.
+        With measurement axes covering the full IRF range, the response
+        summed over all the measurement bins must equal the IRF
+        histogram content exactly, for every NuLambda and Ei bin,
+        independently of the sampling.
         """
 
-        irf = _make_random_irf(nside=1, seed=3, theta_edges_deg=np.linspace(-40, 40, 9))
+        irf = _make_random_irf(seed=1)
 
-        meas = _measurement_axes(em_edges=np.array([150., 210., 260., 330.]),
-                                 phi_edges_deg=np.linspace(0, 180, 7),
-                                 nside=2)
+        dr = RelativeIRFDetectorResponse(irf, _measurement_axes(phi_edges_deg=phi_edges_deg, nside=nside),
+                                         psichi_subdivision=psichi_subdivision)
 
-        dr = RelativeIRFDetectorResponse(irf, meas, phi_samples=2, psichi_subdivision=1)
+        expected = _histogram_total(irf)
 
-        pix = 4
-        response = dr._get_pixel(pix)  # (Ei, Em, Phi, PsiChi)
+        for pix in range(dr.npix):
+            np.testing.assert_allclose(dr._get_pixel(pix).sum(axis=(1, 2, 3)), expected[pix], rtol=1e-10)
 
-        ei_index = 1
-        ei = dr._ei_keV[ei_index]
+    def test_partial_ranges(self):
+        """Restricted Em and Phi ranges only lose content."""
 
+        irf = _make_random_irf(seed=2)
+
+        meas = _measurement_axes(em_edges=np.geomspace(150, 600, 11), phi_edges_deg=np.linspace(30, 150, 5))
+
+        dr = RelativeIRFDetectorResponse(irf, meas)
+
+        expected = _histogram_total(irf)
+
+        for pix in range(dr.npix):
+            total = dr._get_pixel(pix).sum(axis=(1, 2, 3))
+            assert np.all(total < expected[pix])
+            assert np.all(total > 0)
+
+    def test_em_exact(self):
+        """
+        Summed over Phi and PsiChi, the Em distribution is the exact
+        Epsilon -> Em redistribution of the histogram contents.
+        """
+
+        irf = _make_random_irf(seed=3)
+
+        em_edges = np.geomspace(10, 5000, 31)
+        dr = RelativeIRFDetectorResponse(irf, _measurement_axes(em_edges=em_edges))
+
+        d = irf.differential_effective_area_hist
+        ax = d.axes
+
+        phi_m, theta_m, zeta_m = np.meshgrid(ax['Phi'].edges, ax['Theta'].edges, ax['Zeta'].edges, indexing='ij')
+        ps_cds = RelativeCDSCoordinates.get_relative_cds_phase_space(phi_m[:-1, :-1, :-1], phi_m[1:, :-1, :-1],
+                                                                     theta_m[:-1, :-1, :-1], theta_m[:-1, 1:, :-1],
+                                                                     zeta_m[:-1, :-1, :-1], zeta_m[:-1, :-1, 1:])
+
+        pix = 3
+        content_eps = np.einsum('ieabz,abz->ie', np.asarray(d.contents[pix]), ps_cds) \
+                      * ax['Ei'].centers[:, None] * ax['Epsilon'].widths[None, :]
+
+        response_em = dr._get_pixel(pix).sum(axis=(2, 3))
+
+        for i, ei in enumerate(ax['Ei'].centers):
+
+            em_lo = ei * (1 + ax['Epsilon'].edges[:-1])
+            em_hi = ei * (1 + ax['Epsilon'].edges[1:])
+
+            expected = np.zeros(len(em_edges) - 1)
+
+            for c, lo, hi in zip(content_eps[i], em_lo, em_hi):
+                overlap = np.clip(np.minimum(hi, em_edges[1:]) - np.maximum(lo, em_edges[:-1]), 0, None)
+                expected += c * overlap / (hi - lo)
+
+            np.testing.assert_allclose(response_em[i], expected, rtol=1e-10, atol=1e-12)
+
+
+class TestConventions:
+
+    def test_single_bin_lands_at_expected_direction(self):
+        """
+        An IRF with a single non-empty relative bin must produce a
+        response concentrated in the data Phi bin of that IRF bin and in
+        the Em bin of Ei*(1+Epsilon), with PsiChi pixels centered on the
+        direction of the bin center (Phi + Theta from the source, at
+        azimuth Zeta in the IRF polarization convention).
+        """
+
+        axes = _irf_axes(nside=1,
+                         phi_edges_deg=np.linspace(0, 180, 19),
+                         theta_edges_deg=np.linspace(-90, 90, 19),
+                         zeta_edges_deg=np.linspace(0, 360, 17))
+
+        contents = np.zeros(axes.nbins)
+
+        i_ei, i_eps, a, b, c = 1, 4, 6, 10, 3   # Phi 60-70 deg, Theta 10-20 deg, Zeta 67.5-90 deg
+        contents[:, i_ei, i_eps, a, b, c] = 1
+
+        irf = IRFRelativeHistUnpolarized(Histogram(axes, contents=contents, unit=u.cm * u.cm))
+
+        meas = _measurement_axes(phi_edges_deg=np.linspace(0, 180, 19), nside=16)
+
+        dr = RelativeIRFDetectorResponse(irf, meas, psichi_subdivision=1)
+
+        pix = 5
+        r = dr._get_pixel(pix)    # (Ei, Em, Phi, PsiChi)
+
+        # Total conserved: content of one bin = 1 cm2
+        np.testing.assert_allclose(r.sum(), 1, rtol=1e-10)
+
+        # Only the right Ei and data Phi bin
+        np.testing.assert_allclose(r[i_ei].sum(), 1, rtol=1e-10)
+        np.testing.assert_allclose(r[i_ei, :, a].sum(), 1, rtol=1e-10)
+
+        # Em: Ei * (1 + Epsilon) for that bin
+        ei = irf.axes['Ei'].centers[i_ei]
+        eps_lo, eps_hi = irf.axes['Epsilon'].edges[[i_eps, i_eps + 1]]
+        em_edges = meas['Em'].edges.to_value(u.keV)
+        em_bins = np.nonzero(r[i_ei].sum(axis=(1, 2)) > 0)[0]
+        assert em_edges[em_bins[0]] < ei * (1 + eps_lo) + 1e-9
+        assert em_edges[em_bins[-1] + 1] > ei * (1 + eps_hi) - 1e-9
+
+        # PsiChi: content-weighted mean direction close to the bin center direction
         src_vec = np.asarray(dr.pix2vec(pix))
-        src_lon = np.arctan2(src_vec[1], src_vec[0])
-        src_lat = np.arcsin(src_vec[2])
+        relcoords = RelativeCDSCoordinates(src_vec[:, None], irf.pol_convention)
 
-        theta_lo, theta_hi = np.deg2rad(-40), np.deg2rad(40)
+        phi_c = np.deg2rad(65 + 15)
+        zeta_c = np.deg2rad(78.75)
+        expected_vec = np.asarray(relcoords.to_cds(np.array([phi_c]), np.array([zeta_c]))).reshape(3)
 
-        n_em = 2000
+        psichi_weights = r[i_ei].sum(axis=(0, 1))
+        psichi_vecs = np.asarray(hp.pix2vec(16, np.arange(hp.nside2npix(16))))
+        mean_vec = psichi_vecs @ psichi_weights
+        mean_vec /= np.linalg.norm(mean_vec)
 
-        for em_bin, phi_bin, psichi_bin in [(0, 1, 3), (1, 2, 10), (2, 3, 25), (1, 4, 40)]:
+        angle = np.rad2deg(np.arccos(np.clip(mean_vec @ expected_vec, -1, 1)))
 
-            em_lo, em_hi = meas['Em'].edges.to_value(u.keV)[[em_bin, em_bin + 1]]
-            em = em_lo + (np.arange(n_em) + 0.5) / n_em * (em_hi - em_lo)
+        assert angle < 5
 
-            phi_sel = dr._phi_s_bin == phi_bin
-            phis = dr._phi_s[phi_sel]
-            phiw = dr._phi_s_width[phi_sel]
 
-            sub_sel = dr._psichi_sub_bin == psichi_bin
-            sub_vec = dr._psichi_sub_vec[:, sub_sel]
-            sub_w = dr._psichi_sub_weight[sub_sel]
+class TestAeffNormalization:
 
-            # Cartesian product of samples
-            em_m, phi_m, sub_m = np.meshgrid(np.arange(n_em), np.arange(len(phis)), np.arange(sub_vec.shape[1]),
-                                             indexing='ij')
-            em_m, phi_m, sub_m = em_m.ravel(), phi_m.ravel(), sub_m.ravel()
+    @staticmethod
+    def _nested_aeff(seed=5):
+        """AEFF with nside 2 (IRF: 1) and each IRF Ei bin split in 2."""
 
-            v = sub_vec[:, sub_m]
+        rng = np.random.default_rng(seed)
 
-            class Photons:
-                direction_lon_rad_sc = np.full(len(em_m), src_lon)
-                direction_lat_rad_sc = np.full(len(em_m), src_lat)
-                energy_keV = np.full(len(em_m), ei)
+        ei_edges = np.sort(np.concatenate([IRF_EI_EDGES, np.sqrt(IRF_EI_EDGES[1:] * IRF_EI_EDGES[:-1])]))
 
-            class Events:
-                scattered_lon_rad_sc = np.arctan2(v[1], v[0])
-                scattered_lat_rad_sc = np.arcsin(np.clip(v[2], -1, 1))
-                scattering_angle_rad = phis[phi_m]
-                energy_keV = em[em_m]
+        axes = Axes([HealpixAxis(nside=2, scheme='ring', coordsys=SpacecraftFrame(), label='NuLambda'),
+                     Axis(ei_edges * u.keV, label='Ei', scale='log')])
 
-            values = np.asarray(irf._differential_effective_area_cm2(Photons, Events))
+        return Histogram(axes, contents=rng.random(axes.nbins) * 100, unit=u.cm * u.cm)
 
-            # The binned response is zero outside the IRF Theta and
-            # Epsilon ranges, the unbinned evaluation clamps instead
-            phi_geo, _ = RelativeCDSCoordinates(src_vec[:, None], irf.pol_convention).to_relative(v)
-            theta = phi_geo.to_value(u.rad).ravel() - phis[phi_m]
-            eps = em[em_m] / ei - 1
-            eps_edges = irf.axes['Epsilon'].edges
-            inside = ((theta >= theta_lo) & (theta <= theta_hi)
-                      & (eps >= eps_edges[0]) & (eps <= eps_edges[-1]))
-            values = np.where(inside, values, 0)
+    @staticmethod
+    def _expected_average(aeff):
 
-            expected = np.sum(values * phiw[phi_m] * sub_w[sub_m]) * (em_hi - em_lo) / n_em
+        contents = np.asarray(aeff.to(u.cm ** 2).contents.value)
+        ei_widths = np.diff(aeff.axes['Ei'].edges.to_value(u.keV))
 
-            got = response[ei_index, em_bin, phi_bin, psichi_bin]
+        # Width-weighted average over the 2 sub-bins of each IRF Ei bin
+        avg_ei = (contents[:, 0::2] * ei_widths[0::2] + contents[:, 1::2] * ei_widths[1::2]) \
+                 / (ei_widths[0::2] + ei_widths[1::2])
 
-            assert expected > 0
-            np.testing.assert_allclose(got, expected, rtol=2e-3)
+        # Mean over the 4 children of each nside 1 pixel
+        parent = hp.nest2ring(1, hp.ring2nest(2, np.arange(48)) // 4)
+
+        avg = np.zeros((12, avg_ei.shape[1]))
+        np.add.at(avg, parent, avg_ei / 4)
+
+        return avg
+
+    def test_normalize_to_aeff(self):
+
+        aeff = self._nested_aeff()
+        irf = _make_random_irf(seed=4, aeff=aeff)
+
+        expected = self._expected_average(aeff)
+
+        dr = RelativeIRFDetectorResponse(irf, _measurement_axes(nside=2), normalize_to_aeff=True)
+
+        for pix in range(dr.npix):
+            np.testing.assert_allclose(dr._get_pixel(pix).sum(axis=(1, 2, 3)), expected[pix], rtol=1e-10)
+
+        # Ratio helper
+        ratio = dr.aeff_ratio()
+        assert list(ratio.axes.labels) == ['NuLambda', 'Ei']
+        np.testing.assert_allclose(ratio.contents, expected / _histogram_total(irf), rtol=1e-10)
+
+        # The shape is not changed
+        dr_raw = RelativeIRFDetectorResponse(irf, _measurement_axes(nside=2))
+        pix = 7
+        raw = dr_raw._get_pixel(pix)
+        norm = dr._get_pixel(pix)
+        np.testing.assert_allclose(norm, raw * ratio.contents[pix][:, None, None, None], rtol=1e-10)
+
+    def test_non_nested_aeff(self):
+
+        rng = np.random.default_rng(0)
+        axes = Axes([HealpixAxis(nside=2, scheme='ring', coordsys=SpacecraftFrame(), label='NuLambda'),
+                     Axis(np.geomspace(50, 2000, 6) * u.keV, label='Ei', scale='log')])
+        aeff = Histogram(axes, contents=rng.random(axes.nbins), unit=u.cm * u.cm)
+
+        irf = _make_random_irf(aeff=aeff)
+
+        # Fine without normalization
+        RelativeIRFDetectorResponse(irf, _measurement_axes(nside=2))
+
+        with pytest.raises(ValueError):
+            RelativeIRFDetectorResponse(irf, _measurement_axes(nside=2), normalize_to_aeff=True)
 
 
 class TestCacheAndAccess:
@@ -327,7 +380,7 @@ class TestCacheAndAccess:
         with pytest.raises(IndexError):
             dr._get_pixel(dr.npix)
 
-    def test_getitem_and_interp(self):
+    def test_getitem(self):
 
         irf = _make_random_irf()
         dr = RelativeIRFDetectorResponse(irf, _measurement_axes(nside=2))
@@ -335,11 +388,6 @@ class TestCacheAndAccess:
         r = dr[2]
         assert r.unit == u.cm ** 2
         np.testing.assert_allclose(r.contents.to_value(u.cm ** 2), dr._get_pixel(2))
-
-        # At a pixel center, the interpolated response is that pixel
-        coord = dr.pix2skycoord(2)
-        np.testing.assert_allclose(dr.get_interp_response(coord).contents.to_value(u.cm ** 2),
-                                   dr._get_pixel(2), rtol=1e-5)
 
 
 class TestDumpAndToDr:

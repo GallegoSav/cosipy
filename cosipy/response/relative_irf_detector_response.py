@@ -9,6 +9,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
+from scipy import sparse
 
 import h5py as h5
 import healpy as hp
@@ -17,13 +18,14 @@ import astropy.units as u
 from astropy.units import Quantity
 
 from mhealpy import HealpixBase
-from histpy import Axis, Axes, HealpixAxis
+from histpy import Axis, Axes, HealpixAxis, Histogram
 from scoords import SpacecraftFrame
 
 from .FullDetectorResponse import FullDetectorResponse
 from .DetectorResponse import DetectorResponse
 from .relative_irf_hist import IRFRelativeHistUnpolarized
-from ._relative_irf_binning import build_transfer_matrix, integrate_em_bins, subsample_edges
+from .relative_coordinates import RelativeCDSCoordinates
+from ._relative_irf_binning import subsample_edges, find_bins, overlap_matrix, em_overlap_fractions
 
 import logging
 logger = logging.getLogger(__name__)
@@ -37,50 +39,69 @@ def _is_nested(axis) -> bool:
 
 class RelativeIRFDetectorResponse(FullDetectorResponse):
     """
-    A :class:`FullDetectorResponse` computed on the fly from a
+    A :class:`FullDetectorResponse` built from the bins of a
     relative-coordinate histogram IRF
-    (:class:`~cosipy.response.relative_irf_hist.IRFRelativeHistUnpolarized`).
+    (:class:`~cosipy.response.relative_irf_hist.IRFRelativeHistUnpolarized`),
+    without interpolation.
 
-    The relative IRF describes the differential effective area as a
-    function of the photon direction (``NuLambda``) and energy
-    (``Ei``), and of the measured quantities expressed relative to the
-    photon (``Epsilon``, ``Phi``, ``Theta``, ``Zeta``). This class
-    integrates it over the bins of an absolute Compton Data Space
-    (``Em``, ``Phi``, ``PsiChi``), chosen by the user -- typically the
-    axes of the binned data -- producing, for each ``NuLambda`` pixel,
-    the same ``[Ei, Em, Phi, PsiChi]`` matrix (in cm^2) that a
-    :class:`FullDetectorResponse` read from file would provide. All
-    the algorithms of :class:`FullDetectorResponse` that only rely on
-    those per-pixel matrices are inherited as is
-    (:meth:`get_interp_response`, :meth:`get_point_source_response`,
-    including the scatt-map/inertial-frame path,
-    :meth:`get_extended_source_response`, ...), and an instance can be
-    passed to :class:`~cosipy.response.BinnedInstrumentResponse`.
+    The relative IRF bins the response in photon direction
+    (``NuLambda``) and energy (``Ei``), and in measured quantities
+    expressed relative to the photon (``Epsilon``, ``Phi``, ``Theta``,
+    ``Zeta``). This class keeps the IRF ``NuLambda`` and ``Ei`` axes as
+    they are, and redistributes the content of each relative bin into
+    the bins of an absolute Compton Data Space (``Em``, ``Phi``,
+    ``PsiChi``) chosen by the user -- typically the axes of the binned
+    data. For each ``NuLambda`` pixel this gives the same
+    ``[Ei, Em, Phi, PsiChi]`` matrix (in cm^2) that a
+    :class:`FullDetectorResponse` read from file provides, so all the
+    algorithms of :class:`FullDetectorResponse` that rely on those
+    per-pixel matrices are inherited as is
+    (:meth:`get_point_source_response`, including the
+    scatt-map/inertial-frame path, :meth:`get_extended_source_response`,
+    ...), and an instance can be passed to
+    :class:`~cosipy.response.BinnedInstrumentResponse`.
 
     Earth occultation is not a property of the response: as for a
     regular :class:`FullDetectorResponse`, it is handled by the
     ``scatt_map`` (``SpacecraftHistory.get_scatt_map(earth_occ=True)``).
 
-    Integration
-    -----------
-    For a ``NuLambda`` pixel the source direction is the pixel center,
-    and the IRF is bilinearly interpolated to it (HEALPix
-    interpolation). The photon energy is evaluated at the ``Ei`` bin
-    centers (linear interpolation of the IRF in ``Ei``), consistent
-    with how :class:`FullDetectorResponse` contents are used.
+    Redistribution
+    --------------
+    The response density is assumed constant within each relative bin
+    (the same assumption used to store it), and each bin content is
+    split in proportion to its overlap with the absolute bins. The
+    content is therefore conserved: summed over all the absolute bins,
+    the response equals the IRF histogram content of that
+    ``(NuLambda, Ei)`` bin, minus the part outside of the measured
+    ``Em`` and ``Phi`` ranges. The source direction is the center of
+    the ``NuLambda`` pixel, and the photon energy is the ``Ei`` bin
+    center (as used by the IRF to compute its ``Epsilon`` phase space).
 
-    - ``Em``: integrated exactly, consistent with the piecewise-linear
-      interpolation of the IRF along ``Epsilon = Em/Ei - 1``.
-    - ``Phi``: midpoint rule with ``phi_samples`` samples per bin.
-    - ``PsiChi``: each pixel is split into ``4**psichi_subdivision``
-      HEALPix sub-pixels (midpoint rule on the sphere).
+    - ``Em``: the overlap with each ``Epsilon`` bin
+      (``Em = Ei * (1 + Epsilon)``) is computed exactly.
+    - ``Phi``, ``PsiChi``: a relative (``Phi``, ``Theta``, ``Zeta``)
+      bin is a patch of the sky (a slice of a ring around the source
+      direction) whose boundaries never match HEALPix pixels. Its
+      overlap with each (``Phi``, ``PsiChi``) bin is estimated by
+      sampling: ``phi_samples`` values per IRF ``Phi`` bin and
+      ``4**psichi_subdivision`` sub-pixels per ``PsiChi`` pixel. The
+      sampled overlaps are normalized per relative bin, so the
+      sampling only affects how the content is split between
+      neighboring bins, not the total. Relative bins too small to be
+      hit by any sample are assigned to the bin containing their
+      center. Increase the sampling if the ``PsiChi`` pixels or the
+      data ``Phi`` bins are coarse compared to the IRF ``Theta`` bins.
 
-    At each (Phi, PsiChi) sample the IRF is multilinearly interpolated
-    in (Phi, Theta, Zeta), the same model used by the unbinned
-    evaluation of the IRF. Points outside of the IRF axes ranges have
-    zero response. Increase ``phi_samples`` and ``psichi_subdivision``
-    if the Phi or PsiChi bins are coarse compared to the IRF ``Theta``
-    resolution (angular resolution).
+    Normalization
+    -------------
+    By default only the IRF differential histogram (``IRF`` group of
+    the file) is used. If the IRF was loaded with a separate total
+    effective area (``AEFF`` group), ``normalize_to_aeff=True``
+    rescales each ``(NuLambda, Ei)`` slice so that its total over the
+    full measurement space equals the ``AEFF`` effective area averaged
+    over that IRF bin -- the normalization used by the unbinned
+    likelihood. The ``AEFF`` grid must be nested in the IRF one. See
+    :meth:`aeff_ratio`.
 
     The per-pixel computation is cached. Alternatively, all pixels
     can be precomputed with :meth:`to_dr`, or written to a standard
@@ -96,29 +117,24 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
         which is preserved), e.g. ``binned_data.axes``. The ``PsiChi``
         axis can be in any frame (e.g. galactic): only its nside and
         scheme are used, and the response ``PsiChi`` axis is always in
-        the spacecraft frame.
-    energy_axis : histpy.Axis, optional
-        Photon energy binning (``Ei``). Defaults to the IRF ``Ei``
-        axis. When used through :class:`BinnedThreeMLPointSourceResponse`
-        you must pass this same axis as its ``energy_axis``.
-    nside : int, optional
-        NSIDE of the ``NuLambda`` axis. Defaults to that of the IRF.
-    scheme : str, optional
-        HEALPix scheme of the ``NuLambda`` axis. Defaults to that of
-        the IRF.
+        the spacecraft frame. Using the IRF ``Phi`` binning is
+        recommended.
     phi_samples : int, optional
-        Number of samples per ``Phi`` bin. Default 3.
+        Number of samples per IRF ``Phi`` bin. Default 3.
     psichi_subdivision : int, optional
-        Each ``PsiChi`` pixel is split into ``4**psichi_subdivision``
+        Each ``PsiChi`` pixel is sampled with ``4**psichi_subdivision``
         sub-pixels. Default 1.
+    normalize_to_aeff : bool, optional
+        Rescale to the IRF total effective area (``AEFF``). Default
+        False.
     cache_size : int or None, optional
         Maximum number of ``NuLambda`` pixels kept in memory (least
         recently used are dropped). ``None`` (default) means no limit,
         ``0`` disables the cache. Each pixel takes
         ``8 * nEi * nEm * nPhi * nPsiChi`` bytes.
     max_pairs : int, optional
-        Maximum number of (Phi, PsiChi) sample pairs processed at once,
-        to bound the memory used during the computation.
+        Maximum number of (Phi, PsiChi) samples processed at once, to
+        bound the memory used during the computation.
     dtype : numpy dtype, optional
         Data type of the returned contents. Default float64.
     """
@@ -126,11 +142,9 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
     def __init__(self,
                  irf: IRFRelativeHistUnpolarized,
                  measurement_axes: Axes,
-                 energy_axis: Axis = None,
-                 nside: int = None,
-                 scheme: str = None,
                  phi_samples: int = 3,
                  psichi_subdivision: int = 1,
+                 normalize_to_aeff: bool = False,
                  cache_size: int = None,
                  max_pairs: int = 2_000_000,
                  dtype=np.float64):
@@ -147,6 +161,7 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
         self._irf = irf
         self._phi_samples = int(phi_samples)
         self._psichi_subdivision = int(psichi_subdivision)
+        self._normalize_to_aeff = bool(normalize_to_aeff)
         self._max_pairs = int(max_pairs)
         self._cache_size = cache_size
         self._cache = OrderedDict()
@@ -180,28 +195,15 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
         local_psichi_axis = psichi_axis.copy()
         local_psichi_axis.coordsys = SpacecraftFrame()
 
-        # ---- Photon energy axis ----
-        if energy_axis is None:
-            irf_ei = irf_axes['Ei']
-            energy_axis = Axis(irf_ei.edges * u.keV, label='Ei', scale=irf_ei.axis_scale)
-
-        if energy_axis.label != 'Ei':
-            raise ValueError(f"energy_axis must have label 'Ei', got '{energy_axis.label}'")
-
-        if energy_axis.unit is None or not energy_axis.unit.is_equivalent(u.keV):
-            raise ValueError("energy_axis must have units of energy")
-
-        # ---- NuLambda axis ----
+        # ---- NuLambda and Ei: the IRF ones ----
         irf_nulambda = irf_axes['NuLambda']
+        irf_ei = irf_axes['Ei']
 
-        if nside is None:
-            nside = irf_nulambda.nside
-
-        if scheme is None:
-            scheme = 'nested' if _is_nested(irf_nulambda) else 'ring'
-
-        nulambda_axis = HealpixAxis(nside=nside, scheme=scheme,
+        nulambda_axis = HealpixAxis(nside=irf_nulambda.nside,
+                                    scheme='nested' if _is_nested(irf_nulambda) else 'ring',
                                     coordsys=SpacecraftFrame(), label='NuLambda')
+
+        energy_axis = Axis(np.asarray(irf_ei.edges, dtype=float) * u.keV, label='Ei', scale=irf_ei.axis_scale)
 
         # ---- FullDetectorResponse state ----
         # Keep the measurement axes order, so the rest axes match the
@@ -227,26 +229,47 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
 
         # ---- Precomputed quantities, independent of NuLambda ----
 
-        # Photon energy evaluation points and IRF interpolation weights
-        self._ei_keV = np.asarray(energy_axis.centers.to_value(u.keV), dtype=float)
-
-        irf_ei_edges = np.asarray(irf_axes['Ei'].edges, dtype=float)
-        self._ei_inside = (self._ei_keV >= irf_ei_edges[0]) & (self._ei_keV <= irf_ei_edges[-1])
-
-        if irf_axes['Ei'].nbins > 1:
-            ei_bins, ei_weights = irf_axes['Ei'].interp_weights(self._ei_keV)
-            self._ei_ibins = np.asarray(ei_bins)
-            self._ei_iweights = np.asarray(ei_weights)
-        else:
-            self._ei_ibins = np.zeros((2, len(self._ei_keV)), dtype=int)
-            self._ei_iweights = np.vstack([np.ones(len(self._ei_keV)), np.zeros(len(self._ei_keV))])
+        # Photon energies (keV): same centers the IRF used for its phase space
+        self._ei_keV = np.asarray(irf_ei.centers, dtype=float)
 
         # Measured energy
         self._em_edges_keV = np.asarray(em_axis.edges.to_value(u.keV), dtype=float)
+        self._eps_edges = np.asarray(irf_axes['Epsilon'].edges, dtype=float)
+        self._eps_widths = np.asarray(irf_axes['Epsilon'].widths, dtype=float)
 
-        # Phi samples (rad)
-        phi_edges_rad = np.asarray(phi_axis.edges.to_value(u.rad), dtype=float)
-        self._phi_s, self._phi_s_bin, self._phi_s_width = subsample_edges(phi_edges_rad, self._phi_samples)
+        # Exact Epsilon -> Em fractions, per Ei. Shape (nEi, nEps, nEm)
+        self._em_fractions = np.stack([em_overlap_fractions(ei, self._eps_edges, self._em_edges_keV)
+                                       for ei in self._ei_keV])
+
+        # IRF relative axes (rad)
+        self._irf_phi_edges = np.asarray(irf_axes['Phi'].edges, dtype=float)
+        self._irf_theta_edges = np.asarray(irf_axes['Theta'].edges, dtype=float)
+        self._irf_zeta_edges = np.asarray(irf_axes['Zeta'].edges, dtype=float)
+
+        self._irf_rel_shape = (len(self._irf_phi_edges) - 1,
+                               len(self._irf_theta_edges) - 1,
+                               len(self._irf_zeta_edges) - 1)
+        self._n_rel = int(np.prod(self._irf_rel_shape))
+
+        # Phase space of each relative bin (sr * rad), flattened in C order
+        phi_m, theta_m, zeta_m = np.meshgrid(self._irf_phi_edges, self._irf_theta_edges, self._irf_zeta_edges,
+                                             indexing='ij')
+
+        self._ps_cds = np.asarray(RelativeCDSCoordinates.get_relative_cds_phase_space(
+            phi_m[:-1, :-1, :-1], phi_m[1:, :-1, :-1],
+            theta_m[:-1, :-1, :-1], theta_m[:-1, 1:, :-1],
+            zeta_m[:-1, :-1, :-1], zeta_m[:-1, :-1, 1:]), dtype=float).reshape(-1)
+
+        # Phi samples (rad), per IRF Phi bin, and the data Phi bin they fall in
+        phi_s, phi_s_irf_bin, phi_s_width = subsample_edges(self._irf_phi_edges, self._phi_samples)
+
+        data_phi_edges = np.asarray(phi_axis.edges.to_value(u.rad), dtype=float)
+
+        self._phi_s = phi_s
+        self._phi_s_irf_bin = phi_s_irf_bin
+        self._phi_s_width = phi_s_width
+        self._phi_s_data_bin = find_bins(data_phi_edges, phi_s)
+        self._data_phi_edges = data_phi_edges
 
         # PsiChi sub-pixels: unit vectors (local frame), parent bin and solid angle
         nside_psichi = psichi_axis.nside
@@ -259,6 +282,8 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
 
         sub_pixels = (parents_nest[:, None] * nsub + np.arange(nsub)[None, :]).ravel()
 
+        self._psichi_nside = nside_psichi
+        self._psichi_nest = _is_nested(psichi_axis)
         self._psichi_sub_vec = np.asarray(hp.pix2vec(nside_sub, sub_pixels, nest=True))
         self._psichi_sub_bin = np.repeat(parents, nsub)
         self._psichi_sub_weight = np.full(len(sub_pixels), 4 * np.pi / hp.nside2npix(nside_sub))
@@ -266,18 +291,8 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
         self._n_phi = phi_axis.nbins
         self._n_psichi = npix_psichi
 
-        # IRF relative axes
-        self._irf_nside = irf_nulambda.nside
-        self._irf_nest = _is_nested(irf_nulambda)
-        self._eps_centers = np.asarray(irf_axes['Epsilon'].centers, dtype=float)
-        self._eps_edges = np.asarray(irf_axes['Epsilon'].edges, dtype=float)
-
-        irf_phi_edges = np.asarray(irf_axes['Phi'].edges, dtype=float)
-        irf_theta_edges = np.asarray(irf_axes['Theta'].edges, dtype=float)
-        self._irf_phi_range = (irf_phi_edges[0], irf_phi_edges[-1])
-        self._irf_theta_range = (irf_theta_edges[0], irf_theta_edges[-1])
-
-        self._irf_rel_shape = (irf_axes['Phi'].nbins, irf_axes['Theta'].nbins, irf_axes['Zeta'].nbins)
+        # Total effective area used for normalize_to_aeff
+        self._aeff_avg = self._average_aeff() if self._normalize_to_aeff else None
 
     # ------------------------------------------------------------------
     # Properties / FullDetectorResponse overrides
@@ -293,6 +308,10 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
     def irf(self) -> IRFRelativeHistUnpolarized:
         """The underlying relative-coordinate IRF."""
         return self._irf
+
+    @property
+    def normalize_to_aeff(self) -> bool:
+        return self._normalize_to_aeff
 
     @property
     def filename(self):
@@ -320,7 +339,8 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
 
     def __str__(self):
         return (f"{self.__class__.__name__}(nside = {self.nside}, "
-                f"phi_samples = {self._phi_samples}, psichi_subdivision = {self._psichi_subdivision})")
+                f"phi_samples = {self._phi_samples}, psichi_subdivision = {self._psichi_subdivision}, "
+                f"normalize_to_aeff = {self._normalize_to_aeff})")
 
     def __repr__(self):
 
@@ -341,6 +361,124 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
                            f"    NBINS: {axis.nbins}\n")
 
         return output
+
+    # ------------------------------------------------------------------
+    # IRF contents
+    # ------------------------------------------------------------------
+
+    def _irf_pixel_density(self, pix: int) -> np.ndarray:
+        """
+        IRF differential effective area for one NuLambda pixel,
+        shape (nEi, nEpsilon, n_rel), cm2/sr/rad/keV.
+        """
+
+        contents = self._irf.differential_effective_area_hist.contents
+
+        slab = contents[pix]
+
+        if hasattr(slab, 'todense'):
+            slab = slab.todense()
+
+        slab = np.asarray(slab, dtype=float)
+
+        return slab.reshape(slab.shape[0], slab.shape[1], -1)
+
+    def _irf_pixel_contents_total(self, pix: int) -> np.ndarray:
+        """
+        Total IRF histogram content (cm2) per Ei for one NuLambda
+        pixel, i.e. the differential effective area integrated over the
+        full relative measurement space.
+        """
+
+        density = self._irf_pixel_density(pix)
+
+        # Epsilon phase space: Ei * dEpsilon (keV)
+        ps_em = self._ei_keV[:, None] * self._eps_widths[None, :]
+
+        return np.einsum('ier,ie,r->i', density, ps_em, self._ps_cds)
+
+    def _average_aeff(self) -> np.ndarray:
+        """
+        IRF total effective area (``AEFF`` if the IRF was loaded with
+        one) averaged over each IRF (NuLambda, Ei) bin.
+
+        Returns
+        -------
+        numpy.ndarray, shape (npix, nEi), cm2
+        """
+
+        tot = self._irf._tot_aeff
+
+        tot_nulambda = tot.axes['NuLambda']
+        tot_ei_edges = np.asarray(tot.axes['Ei'].edges, dtype=float)
+        tot_contents = np.asarray(tot.contents, dtype=float)
+
+        ei_edges = np.asarray(self._irf.axes['Ei'].edges, dtype=float)
+
+        # ---- Ei: the AEFF edges must subdivide the IRF ones ----
+        idx = np.argmin(np.abs(tot_ei_edges[None, :] - ei_edges[:, None]), axis=1)
+
+        nested = np.allclose(tot_ei_edges[idx], ei_edges, rtol=1e-6, atol=0)
+
+        if not nested:
+            raise ValueError("normalize_to_aeff requires the AEFF Ei edges to include all the IRF Ei edges. "
+                             f"IRF Ei edges: {ei_edges}, AEFF Ei edges: {tot_ei_edges}")
+
+        tot_ei_widths = np.diff(tot_ei_edges)
+
+        aeff_ei = np.empty((tot_contents.shape[0], len(ei_edges) - 1))
+
+        for i in range(len(ei_edges) - 1):
+            sl = slice(idx[i], idx[i + 1])
+            aeff_ei[:, i] = (np.sum(tot_contents[:, sl] * tot_ei_widths[sl], axis=1)
+                             / np.sum(tot_ei_widths[sl]))
+
+        # ---- NuLambda: AEFF nside must be the IRF one times a power of 2 ----
+        nside = self.nside
+        tot_nside = tot_nulambda.nside
+
+        ratio = tot_nside // nside
+
+        if tot_nside % nside != 0 or ratio & (ratio - 1) != 0:
+            raise ValueError(f"normalize_to_aeff requires the AEFF nside ({tot_nside}) to be the IRF nside "
+                             f"({nside}) times a power of 2")
+
+        nchildren = ratio ** 2
+
+        # Parent (IRF) pixel of each AEFF pixel, in the IRF scheme
+        tot_pix = np.arange(tot_nulambda.npix)
+        tot_pix_nest = tot_pix if _is_nested(tot_nulambda) else hp.ring2nest(tot_nside, tot_pix)
+
+        parent_nest = tot_pix_nest // nchildren
+        parent = parent_nest if _is_nested(self._axes['NuLambda']) else hp.nest2ring(nside, parent_nest)
+
+        aeff = np.zeros((self.npix, aeff_ei.shape[1]))
+        np.add.at(aeff, parent, aeff_ei)
+
+        return aeff / nchildren
+
+    def aeff_ratio(self) -> Histogram:
+        """
+        Ratio between the IRF total effective area (``AEFF`` if the
+        IRF was loaded with one) averaged over each IRF
+        ``(NuLambda, Ei)`` bin, and the content of the IRF differential
+        histogram in that bin. This is the factor applied by
+        ``normalize_to_aeff=True``. NaN where the histogram is empty.
+
+        Returns
+        -------
+        histpy.Histogram
+            Axes ``NuLambda``, ``Ei``.
+        """
+
+        aeff = self._aeff_avg if self._aeff_avg is not None else self._average_aeff()
+
+        hist_total = np.array([self._irf_pixel_contents_total(pix) for pix in range(self.npix)])
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(hist_total > 0, aeff / hist_total, np.nan)
+
+        return Histogram(Axes([self._axes['NuLambda'], self._axes['Ei']]), contents=ratio)
 
     # ------------------------------------------------------------------
     # Per-pixel response
@@ -403,46 +541,22 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
 
         return data
 
-    def _interp_irf_nulambda(self, src_vec: np.ndarray) -> np.ndarray:
+    def _overlap_matrix(self, src_vec: np.ndarray):
         """
-        IRF differential effective area bilinearly interpolated at the
-        source direction (HEALPix interpolation).
+        Fraction of each IRF relative (Phi, Theta, Zeta) bin in each
+        absolute (Phi, PsiChi) bin, for a given source direction.
 
         Returns
         -------
-        numpy.ndarray, shape (nEi_irf, nEpsilon, nPhi_irf, nTheta, nZeta)
+        scipy.sparse.csr_matrix, shape (n_rel, nPhi * nPsiChi)
         """
 
-        theta, phi = hp.vec2ang(src_vec)
-        theta = float(np.ravel(theta)[0])
-        phi = float(np.ravel(phi)[0])
-
-        pixels, weights = hp.get_interp_weights(self._irf_nside, theta, phi, nest=self._irf_nest)
-        pixels = np.ravel(pixels)
-        weights = np.ravel(weights)
-
-        contents = self._irf.differential_effective_area_hist.contents
-
-        if hasattr(contents, 'todense'):
-            # Sparse contents
-            slab = sum(w * np.asarray(contents[p].todense()) for p, w in zip(pixels, weights) if w != 0)
-        else:
-            contents = np.asarray(contents)
-            slab = np.tensordot(weights, contents[pixels], axes=(0, 0))
-
-        return slab
-
-    def _transfer_matrix(self, src_vec: np.ndarray):
-        """
-        Sparse map from the IRF relative (Phi, Theta, Zeta) bins to the
-        absolute (Phi, PsiChi) bins for a given source direction. See
-        :func:`cosipy.response._relative_irf_binning.build_transfer_matrix`.
-        """
-
-        from .relative_coordinates import RelativeCDSCoordinates
+        n_theta, n_zeta = self._irf_rel_shape[1], self._irf_rel_shape[2]
+        n_abs = self._n_phi * self._n_psichi
 
         relcoords = RelativeCDSCoordinates(src_vec[:, None], pol_convention=self._irf.pol_convention)
 
+        # Geometry of the PsiChi sub-pixels relative to the source
         phi_geo, az = relcoords.to_relative(self._psichi_sub_vec)
 
         phi_geo = np.asarray(phi_geo.to_value(u.rad), dtype=float).ravel()
@@ -450,29 +564,79 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
         # to_relative returns az in (-pi, pi]; the IRF Zeta axis spans [0, 2pi)
         zeta = np.asarray(az.to_value(u.rad), dtype=float).ravel() % (2 * np.pi)
 
-        irf_axes = self._irf.axes
+        zeta_bin = find_bins(self._irf_zeta_edges, zeta)
 
-        return build_transfer_matrix(phi_geo=phi_geo,
-                                     zeta=zeta,
-                                     psichi_bin=self._psichi_sub_bin,
-                                     psichi_weight=self._psichi_sub_weight,
-                                     phi_samples=self._phi_s,
-                                     phi_bin=self._phi_s_bin,
-                                     phi_weight=self._phi_s_width,
-                                     n_psichi=self._n_psichi,
-                                     n_phi=self._n_phi,
-                                     irf_shape=self._irf_rel_shape,
-                                     theta_range=self._irf_theta_range,
-                                     phi_range=self._irf_phi_range,
-                                     phi_interp_weights=irf_axes['Phi'].interp_weights,
-                                     theta_interp_weights=irf_axes['Theta'].interp_weights,
-                                     zeta_interp_weights=irf_axes['Zeta'].interp_weights,
-                                     max_pairs=self._max_pairs)
+        # Samples: (Phi sample, PsiChi sub-pixel) pairs, by blocks of Phi samples
+        rel_list, abs_list, w_list = [], [], []
+
+        block = max(1, self._max_pairs // max(1, len(phi_geo)))
+
+        for start in range(0, len(self._phi_s), block):
+
+            sl = slice(start, start + block)
+
+            theta = phi_geo[None, :] - self._phi_s[sl, None]
+            theta_bin = find_bins(self._irf_theta_edges, theta.ravel()).reshape(theta.shape)
+
+            i_phi, i_sub = np.nonzero((theta_bin >= 0) & (zeta_bin[None, :] >= 0))
+
+            if len(i_phi) == 0:
+                continue
+
+            i_phi_global = i_phi + start
+
+            rel = ((self._phi_s_irf_bin[i_phi_global] * n_theta + theta_bin[i_phi, i_sub]) * n_zeta
+                   + zeta_bin[i_sub])
+
+            data_phi_bin = self._phi_s_data_bin[i_phi_global]
+
+            absolute = np.where(data_phi_bin >= 0,
+                                data_phi_bin * self._n_psichi + self._psichi_sub_bin[i_sub],
+                                -1)
+
+            rel_list.append(rel)
+            abs_list.append(absolute)
+            w_list.append(self._phi_s_width[i_phi_global] * self._psichi_sub_weight[i_sub])
+
+        if rel_list:
+            rel = np.concatenate(rel_list)
+            absolute = np.concatenate(abs_list)
+            weight = np.concatenate(w_list)
+        else:
+            rel = absolute = np.zeros(0, dtype=int)
+            weight = np.zeros(0)
+
+        # Fallback for physical relative bins not hit by any sample:
+        # the absolute bin containing the bin center
+        sampled = np.bincount(rel, minlength=self._n_rel) > 0
+        unsampled = np.nonzero(~sampled & (self._ps_cds > 0))[0]
+
+        fallback = np.full(self._n_rel, -1, dtype=np.int64)
+
+        if len(unsampled):
+
+            a, b, c = np.unravel_index(unsampled, self._irf_rel_shape)
+
+            phi_c = 0.5 * (self._irf_phi_edges[a] + self._irf_phi_edges[a + 1])
+            theta_c = 0.5 * (self._irf_theta_edges[b] + self._irf_theta_edges[b + 1])
+            zeta_c = 0.5 * (self._irf_zeta_edges[c] + self._irf_zeta_edges[c + 1])
+
+            phi_geo_c = np.clip(phi_c + theta_c, 0, np.pi)
+
+            vec = np.asarray(relcoords.to_cds(phi_geo_c, zeta_c)).reshape(3, -1)
+
+            psichi_pix = hp.vec2pix(self._psichi_nside, vec[0], vec[1], vec[2], nest=self._psichi_nest)
+
+            data_phi_bin = find_bins(self._data_phi_edges, phi_c)
+
+            fallback[unsampled] = np.where(data_phi_bin >= 0, data_phi_bin * self._n_psichi + psichi_pix, -1)
+
+        return overlap_matrix(rel, absolute, weight, self._n_rel, n_abs, fallback)
 
     def _compute_pixel(self, pix: int) -> np.ndarray:
         """
-        Integrate the IRF over the absolute measurement bins for the
-        direction at the center of NuLambda pixel ``pix``.
+        Redistribute the IRF contents of NuLambda pixel ``pix`` into
+        the absolute measurement bins.
 
         Returns
         -------
@@ -482,54 +646,42 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
 
         n_ei = len(self._ei_keV)
         n_em = len(self._em_edges_keV) - 1
-        n_eps = len(self._eps_centers)
         n_cds = self._n_phi * self._n_psichi
+
+        density = self._irf_pixel_density(pix)  # (nEi, nEps, n_rel), per keV sr rad
 
         result = np.zeros((n_ei, n_em, n_cds))
 
-        if np.any(self._ei_inside):
+        if np.any(density):
 
             src_vec = np.asarray(hp.pix2vec(self.nside, pix, nest=_is_nested(self._axes['NuLambda'])),
                                  dtype=float)
 
-            slab = self._interp_irf_nulambda(src_vec)
+            # Content of each relative (Phi, Theta, Zeta) bin -> (Phi, PsiChi) bins,
+            # with the (Phi, Theta, Zeta) phase space folded in
+            overlap_t = (sparse.diags(self._ps_cds) @ self._overlap_matrix(src_vec)).T.tocsr()
 
-            transfer_t = self._transfer_matrix(src_vec).T.tocsr()
+            for i in range(n_ei):
 
-            # Response integrated over each (Phi, PsiChi) bin, still
-            # differential in Em, for each IRF Ei bin that is needed.
-            # Shape (n_cds, n_eps). It's linear in the IRF contents, so
-            # Ei can be interpolated afterwards.
-            density_cache = {}
-
-            def density(i_ei):
-                if i_ei not in density_cache:
-                    d = slab[i_ei].reshape(n_eps, -1)
-                    density_cache[i_ei] = np.asarray(transfer_t @ d.T)
-                return density_cache[i_ei]
-
-            for j in range(n_ei):
-
-                if not self._ei_inside[j]:
+                if not np.any(density[i]):
                     continue
 
-                dens = None
+                # Content per (Epsilon, absolute CDS) bin, still per keV of Em: (nEps, n_cds)
+                content = np.asarray(overlap_t @ density[i].T).T
 
-                for b, w in zip(self._ei_ibins[:, j], self._ei_iweights[:, j]):
-                    if w == 0:
-                        continue
-                    contrib = w * density(int(b))
-                    dens = contrib if dens is None else dens + contrib
+                # Epsilon phase space Ei * dEps (keV) and exact Epsilon -> Em fractions
+                em_weights = self._em_fractions[i] * (self._ei_keV[i] * self._eps_widths)[:, None]
 
-                if dens is None:
-                    continue
+                result[i] = em_weights.T @ content
 
-                result[j] = integrate_em_bins(dens,
-                                              self._ei_keV[j],
-                                              self._em_edges_keV,
-                                              self._eps_centers,
-                                              self._eps_edges,
-                                              IRFRelativeHistUnpolarized._integrate_piecewise_linear)
+            if self._normalize_to_aeff:
+
+                hist_total = self._irf_pixel_contents_total(pix)
+
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    factor = np.where(hist_total > 0, self._aeff_avg[pix] / hist_total, 0)
+
+                result *= factor[:, None, None]
 
         result = result.reshape(n_ei, n_em, self._n_phi, self._n_psichi)
 
@@ -552,7 +704,7 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
     def to_dr(self, show_progress: bool = False) -> DetectorResponse:
         """
         Compute the response for all NuLambda pixels and load it in
-        memory. The cache is neither used nor filled.
+        memory. The cache is used if available, but not filled.
 
         Returns
         -------
@@ -611,6 +763,7 @@ class RelativeIRFDetectorResponse(FullDetectorResponse):
         # Headers, written in alphabetical order so that HEADER_ORDER
         # is the identity (see RspConverter._create_h5)
         headers = {'GENERATOR': self.__class__.__name__,
+                   'NORMALIZE_TO_AEFF': str(self._normalize_to_aeff),
                    'PHI_SAMPLES': str(self._phi_samples),
                    'PSICHI_SUBDIVISION': str(self._psichi_subdivision)}
 
