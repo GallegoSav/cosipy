@@ -27,6 +27,7 @@ class DataIO:
         self.time_bins = inputs['time_bins'] # Time bin size in seconds. Takes int, float, or list of bin edges.
         self.energy_bins = inputs['energy_bins'] # Needs to match response. Takes list.
         self.phi_pix_size = inputs['phi_pix_size'] # Binning of Compton scattering angle [deg]
+        self.phi_bin_edges = inputs['phi_bin_edges'] # Custom binning of Compton scattering angle [deg]
         self.nside = inputs['nside'] # Healpix binning of psi chi local
         self.scheme = inputs['scheme'] # Healpix binning of psi chi local
         self.tmin = inputs['tmin'] # Min time in seconds.
