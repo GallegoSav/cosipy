@@ -103,7 +103,7 @@ class BinnedData(UnBinnedData):
         number_phi_bins = int(180./self.phi_pix_size)
         phi_bin_edges = np.linspace(0,180,number_phi_bins+1)
 
-        if self.phi_bin_edges is not == "None":
+        if self.phi_bin_edges != "None":
             phi_bin_edges = self.phi_bin_edges
                             
         # Define psichi axis and data for binning:
